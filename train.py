@@ -34,6 +34,8 @@ def parse_args():
     # network option & hyper-parameters
     parser.add_argument('--num-class', type=int, default=4, metavar='N',
                         help='number of classes for your data')
+    parser.add_argument('--decoder_attention', action='store_true', default=False,
+                        help='use attention mechnism in LWDecoder')
     parser.add_argument('--batch-size', type=int, default=8, metavar='N',
                         help='input batch size for training (default: 8)')
     parser.add_argument('--epochs', type=int, default=45, metavar='N',
@@ -135,7 +137,7 @@ def main(args):
         print("Test batch number: %i" % len(val_loader))
 
         #### Above: define how you get the data on your own dataset ######
-        model = DconnNet(num_class=args.num_class).cuda()
+        model = DconnNet(num_class=args.num_class, decoder_attention=args.decoder_attention, use_stn=args.use_stn, input_size=args.resize).cuda()
 
         if args.pretrained:
             model.load_state_dict(torch.load(args.pretrained,map_location = torch.device('cpu')))

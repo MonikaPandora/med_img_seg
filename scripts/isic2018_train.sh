@@ -6,7 +6,8 @@ python train.py \
 --resize 224 320 \
 --num-class 1 \
 --batch-size 10 \
---epochs 200 \
+--epochs 100 \
 --lr 0.0001 \
 --lr-update 'CosineAnnealingWarmRestarts' \
+--decoder_attention \
 --folds 5

@@ -20,7 +20,7 @@ up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
 
 class DconnNet(nn.Module):
-    def __init__(self,num_class=1):
+    def __init__(self,num_class=1, decoder_attention=False):
         super(DconnNet,self).__init__()
         
         out_planes = num_class*8
@@ -42,9 +42,10 @@ class DconnNet(nn.Module):
 
         self.relu = nn.ReLU()
         
-        self.final_decoder=LWdecoder(in_channels=[64,64,128,256],out_channels=32,in_feat_output_strides=(4, 8, 16, 32),out_feat_output_stride=4,norm_fn=nn.BatchNorm2d,num_groups_gn=None)
+        self.final_decoder=LWdecoder(in_channels=[64,64,128,256],
+                                     out_channels=32,in_feat_output_strides=(4, 8, 16, 32),out_feat_output_stride=4,
+                                     norm_fn=nn.BatchNorm2d,num_groups_gn=None)
         
-        self.cls_pred_conv = nn.Conv2d(64, 32, 3,1,1)
         self.cls_pred_conv_2 = nn.Conv2d(32, out_planes, 1)
         self.upsample4x_op = nn.UpsamplingBilinear2d(scale_factor=2)
         self.channel_mapping = nn.Sequential(
@@ -59,6 +60,13 @@ class DconnNet(nn.Module):
                     # nn.ReLU(True)
                 )
 
+        self.decoder_attention = decoder_attention
+        if decoder_attention:
+            self.attention_producer = nn.Sequential(
+                nn.Conv2d(64 + 64 + 128 + 256, 1024, 1), nn.ReLU(),
+                nn.Conv2d(1024, 512, 3, 1, 1), nn.ReLU(),
+                nn.Conv2d(512, 32 * 4, 1)
+            )
 
     def forward(self, x):
         
@@ -98,13 +106,23 @@ class DconnNet(nn.Module):
         d2=self.relu(self.fb3(r3)+c2) #64
         r2 = self.sb4(self.gap(r3),d2) 
 
-        d1=self.fb2(r2)+c1 #32
+        d1=self.fb2(r2)+c1 #64
         # d1 = self.sr5(c6,d1) 
 
-        feat_list = [d1,d2,d3,d4,c5]
+        feat_list = [d1,d2,d3,d4]
 
-
-        final_feat = self.final_decoder(feat_list)
+        attns = None
+        if self.decoder_attention:
+            attns = [c1, 
+                     nn.UpsamplingBilinear2d(scale_factor=2)(c2), 
+                     nn.UpsamplingBilinear2d(scale_factor=4)(c3),
+                     nn.UpsamplingBilinear2d(scale_factor=8)(c4),
+                    ]
+            attns = self.attention_producer(torch.cat(attns, dim=1))
+            n, c, h, w = attns.shape
+            attns = torch.split(attns.reshape(n, c // 4, 4, h, w), split_size_or_sections=1, dim=1)
+            attns = torch.concat([F.softmax(attn, dim=2) for attn in attns], dim=1)
+        final_feat = self.final_decoder(feat_list, attns=attns)
 
         cls_pred = self.cls_pred_conv_2(final_feat)
         cls_pred = self.upsample4x_op(cls_pred)
@@ -312,13 +330,19 @@ class LWdecoder(nn.Module):
                 for idx in range(num_layers)]))
             dec_level+=1
 
-    def forward(self, feat_list: list):
+    def forward(self, feat_list: list, attns=None):
         inner_feat_list = []
         for idx, block in enumerate(self.blocks):
             decoder_feat = block(feat_list[idx])
             inner_feat_list.append(decoder_feat)
 
-        out_feat = sum(inner_feat_list) / 4.
+        if attns is None:
+            out_feat = sum(inner_feat_list) / len(inner_feat_list)
+        else:
+            out_feat = attns * torch.stack(inner_feat_list, dim=2)
+            out_feat = torch.split(out_feat, split_size_or_sections=1, dim=1)
+            out_feat = [torch.sum(channel, dim=2) for channel in out_feat]
+            out_feat = torch.concat(out_feat, dim=1)
         return out_feat
 
 class FeatureBlock(nn.Module):
