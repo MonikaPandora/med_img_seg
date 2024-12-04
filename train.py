@@ -137,7 +137,7 @@ def main(args):
         print("Test batch number: %i" % len(val_loader))
 
         #### Above: define how you get the data on your own dataset ######
-        model = DconnNet(num_class=args.num_class, decoder_attention=args.decoder_attention, use_stn=args.use_stn, input_size=args.resize).cuda()
+        model = DconnNet(num_class=args.num_class, decoder_attention=args.decoder_attention).cuda()
 
         if args.pretrained:
             model.load_state_dict(torch.load(args.pretrained,map_location = torch.device('cpu')))

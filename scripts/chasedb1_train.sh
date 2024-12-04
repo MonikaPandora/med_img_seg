@@ -9,7 +9,7 @@ python train.py \
 --epochs 130 \
 --lr 0.0038 \
 --lr-update 'poly' \
---use_stn \
+--decoder_attention \
 --folds 5
 
 
