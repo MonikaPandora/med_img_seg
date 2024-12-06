@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.autograd import Variable
+from PIL import Image
+from torchvision import transforms
 from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
 from data_loader.GetDataset_Retouch import MyDataset
 from data_loader.GetDataset_CHASE import MyDataset_CHASE
@@ -14,6 +16,7 @@ from metrics.cal_betti import getBetti
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+to_pil = transforms.ToPILImage()
 
 
 def parse_args():
@@ -37,18 +40,32 @@ def parse_args():
     parser.add_argument('--decoder_attention', action='store_true', default=False,
                         help='use attention mechnism in LWDecoder')
 
-    # trained path
+    # model weights path
+    # the path should contain #folds of directories
+    # example:
+    # -- /home/xxx/ckpt/
+    # ---- /baseline/
+    # ------ /CHASEDB1/
+    # -------- /1/
+    # ---------- best_model.pth
+    # ...
+    # -------- /5/
+    # ---------- best_model.pth
     parser.add_argument('--ckpt_path', type=str, default=None,
                         help='put the path to checkpoints')
 
-    # output path
+    # output setting
     parser.add_argument('--output_path', type=str, default=None,
                         help='path to save output')
+    parser.add_argument('--num_pred', type=int, default=-1, metavar='N', 
+                        help='number of visualized predictions for each fold, if <=0, visualize all')
     
     args = parser.parse_args()
 
     if not os.path.isdir(args.output_path):
         os.makedirs(args.output_path)
+
+    args.num_pred = max(0, args.num_pred)
 
     return args
 
@@ -58,7 +75,8 @@ def get_metric(pred, gt, metric_type='DSC'):
     ret = 0
     FN = torch.sum((1 - pred) * gt, dim=(2,3)) 
     FP = torch.sum((1 - gt) * pred, dim=(2,3))
-    inter = torch.sum(gt * pred, dim=(2,3))
+    inter = torch.sum(gt * pred, dim=(2,3)) # TP
+    TN = torch.sum((1 - gt) * (1 - pred), dim=(2,3))
     union = torch.sum(gt, dim=(2,3)) + torch.sum(pred, dim=(2,3))
     if metric_type == 'DSC':
         ret = (2 * inter + eps) / (union + eps)
@@ -81,9 +99,29 @@ def get_metric(pred, gt, metric_type='DSC'):
             assert pred[i].shape[0] == 1
             lst.append(getBetti(pred[i][0], gt[i][0], i=1))
         ret = np.mean(lst)
+    elif metric_type == 'ACC':
+        ret = (inter + TN) / (inter + TN + FP + FN + eps)
+    elif metric_type == 'PREC':
+        ret = inter / (inter + FP + eps)
     else:
         raise ValueError(f'metric {metric_type} not supported')
     return ret.item()
+
+
+def predict(model, img, hori, verti, num_class=1):
+    N, C, H, W = img.shape
+    out, _ = model(img)
+    if num_class == 1:  
+        out = F.sigmoid(out)
+        class_pred = out.view([N, -1, 8, H, W]) #(N, C, 8, H, W)
+        pred = torch.where(class_pred > 0.5, 1, 0)
+        pred, _ = Bilateral_voting(pred.float(), hori, verti) # (N, 1, H, W)
+    else:
+        class_pred = out.view([N, -1, 8, H, W]) #(N, C, 8, H, W)
+        final_pred, _ = Bilateral_voting(class_pred, hori, verti)
+        pred = get_mask(final_pred)
+        pred = one_hot(pred, img.shape)
+    return pred
 
 
 def main(args):
@@ -138,27 +176,17 @@ def main(args):
         with torch.no_grad():
             for data in val_loader:
                 img = Variable(data[0]).to(device)
-                mask = Variable(data[1]).long().to(device)
+                gt = Variable(data[1]).long().to(device)
 
-                out, _ = model(img)
                 N, C, H, W = img.shape
 
                 hori = hori_translation.repeat(N, 1, 1, 1).to(device)
                 verti = verti_translation.repeat(N, 1, 1, 1).to(device)
 
-                if args.num_class == 1:  
-                    out = F.sigmoid(out)
-                    class_pred = out.view([N, -1, 8, H, W]) #(N, C, 8, H, W)
-                    pred = torch.where(class_pred > 0.5, 1, 0)
-                    pred, _ = Bilateral_voting(pred.float(), hori, verti) # (N, 1, H, W)
-                else:
-                    class_pred = out.view([N, -1, 8, H, W]) #(N, C, 8, H, W)
-                    final_pred, _ = Bilateral_voting(class_pred, hori, verti)
-                    pred = get_mask(final_pred)
-                    pred = one_hot(pred, img.shape)
+                pred = predict(model, img, hori, verti, num_class=1)
 
                 for metric in metrics.keys():
-                    metrics[metric].append(get_metric(pred, mask, metric_type=metric))
+                    metrics[metric].append(get_metric(pred, gt, metric_type=metric))
 
         with open(os.path.join(args.output_path, 'result.csv'), 'a') as f:
             cur_metrics = []
@@ -167,6 +195,31 @@ def main(args):
                 cur_metrics.append('%.6f' % cur_metric)
                 avg[metric_type] += cur_metric
             f.write(','.join([f'{fold + 1}'] + cur_metrics) + '\n')
+        
+        topk = np.argsort(metrics['DSC'])[-min(args.num_pred, len(val_loader)):][::-1]
+        if not os.path.isdir(os.path.join(args.output_path, f'{fold + 1}')):
+            os.makedirs(os.path.join(args.output_path, f'{fold + 1}'))
+        with torch.no_grad():
+            for idx, data in enumerate(val_loader):
+                if idx not in topk:
+                    continue
+                img = Variable(data[0]).to(device)
+                gt = Variable(data[1]).long().to(device)
+
+                N, C, H, W = img.shape
+
+                hori = hori_translation.repeat(N, 1, 1, 1).to(device)
+                verti = verti_translation.repeat(N, 1, 1, 1).to(device)
+
+                pred = predict(model, img, hori, verti, num_class=1)
+                
+                rank_idx = np.where(topk == idx)[0].item()
+                pred_pic = to_pil(pred.squeeze(0))
+                pred_pic.save(os.path.join(args.output_path, f'{fold + 1}', f'example_{rank_idx + 1}.png'))
+
+                gt_pic = to_pil(gt.to(pred.dtype).squeeze(0))
+                gt_pic.save(os.path.join(args.output_path, f'{fold + 1}', f'ground_truth_{rank_idx + 1}.png'))
+        
     
     with open(os.path.join(args.output_path, 'result.csv'), 'a') as f:
         avg_datas = ['%.6f' % (sum_metric / num_folds) for _, sum_metric in avg.items()]
@@ -176,3 +229,4 @@ def main(args):
 if __name__ == '__main__':
     args = parse_args()
     main(args)
+
